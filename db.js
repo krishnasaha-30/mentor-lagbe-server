@@ -13,3 +13,4 @@ export const database = client.db("mentor-lagbe-app");
 // BetterAuth collections. They are created automatically on first sign-up.
 export const users = database.collection("user");
 export const sessions = database.collection("session");
+export const tuitions = database.collection("tuitions");
