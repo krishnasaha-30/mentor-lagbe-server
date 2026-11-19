@@ -3,8 +3,15 @@ import cors from "cors";
 import { ObjectId } from "mongodb";
 
 import { tuitions, users } from "./db.js";
-import { verifyToken } from "./middleware/auth.js";
+import {
+  verifyToken,
+  verifyTutor,
+} from "./middleware/auth.js";
 import { parseTuitionsQuery } from "./lib/tuitions-query.js";
+import {
+  getTutorPostUsage,
+  validateNewTuition,
+} from "./lib/tuition-validation.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -20,6 +27,26 @@ app.get("/", (req, res) => {
 app.get("/api/health", (req, res) => {
   res.send({ status: "ok" });
 });
+
+app.get(
+  "/api/tuitions/mine/usage",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    try {
+      const postsUsed = await tuitions.countDocuments({
+        tutorId: req.user._id,
+      });
+
+      return res.send(getTutorPostUsage(req.user.plan, postsUsed));
+    } catch (error) {
+      console.error("Failed to get tutor tuition usage:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to load your tuition posting limit." });
+    }
+  },
+);
 
 // Public listings only include approved, active tuitions.
 app.get("/api/tuitions", async (req, res) => {
@@ -128,6 +155,174 @@ app.get("/api/tuitions", async (req, res) => {
   } catch (error) {
     console.error("Failed to fetch public tuitions:", error);
     return res.status(500).send({ message: "Unable to load public tuitions." });
+  }
+});
+
+const parseBannerImage = express.raw({
+  type: ["image/png", "image/jpeg"],
+  limit: "2mb",
+});
+
+function handleBannerImageBody(req, res, next) {
+  parseBannerImage(req, res, (error) => {
+    if (!error) {
+      return next();
+    }
+
+    if (error.type === "entity.too.large") {
+      return res.status(413).send({ message: "Image must be 2 MB or smaller." });
+    }
+
+    return res.status(400).send({ message: "Invalid image upload." });
+  });
+}
+
+function hasValidImageSignature(buffer, contentType) {
+  if (contentType === "image/png") {
+    return buffer.subarray(0, 8).equals(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    );
+  }
+
+  return (
+    contentType === "image/jpeg" &&
+    buffer.length >= 3 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff
+  );
+}
+
+app.post(
+  "/api/tuitions/banner",
+  verifyToken,
+  verifyTutor,
+  handleBannerImageBody,
+  async (req, res) => {
+    const apiKey = process.env.IMGBB_API_KEY;
+
+    if (!apiKey) {
+      return res
+        .status(503)
+        .send({ message: "Image uploads are not configured on the server." });
+    }
+
+    const contentType = req.headers["content-type"]?.split(";")[0];
+
+    if (
+      !Buffer.isBuffer(req.body) ||
+      req.body.length === 0 ||
+      !hasValidImageSignature(req.body, contentType)
+    ) {
+      return res
+        .status(400)
+        .send({ message: "Choose a valid JPG or PNG image." });
+    }
+
+    let postsUsed;
+
+    try {
+      postsUsed = await tuitions.countDocuments({
+        tutorId: req.user._id,
+      });
+    } catch (error) {
+      console.error("Failed to check tutor tuition usage:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to check your tuition posting limit." });
+    }
+
+    if (!getTutorPostUsage(req.user.plan, postsUsed).canCreate) {
+      return res.status(403).send({
+        message:
+          "Free tutors can post up to 2 tuitions. Upgrade to Pro to post more.",
+      });
+    }
+
+    const fileExtension = contentType === "image/png" ? "png" : "jpg";
+    const imageForm = new FormData();
+    imageForm.set(
+      "image",
+      new Blob([req.body], { type: contentType }),
+      `tuition-banner.${fileExtension}`,
+    );
+
+    try {
+      const url = new URL("https://api.imgbb.com/1/upload");
+      url.searchParams.set("key", apiKey);
+
+      const uploadResponse = await fetch(url, {
+        method: "POST",
+        body: imageForm,
+      });
+
+      const uploadResult = await uploadResponse.json();
+
+      if (
+        !uploadResponse.ok ||
+        uploadResult.success !== true ||
+        typeof uploadResult.data?.url !== "string"
+      ) {
+        return res
+          .status(502)
+          .send({ message: "The image service could not upload this file." });
+      }
+
+      return res.send({ url: uploadResult.data.url });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message.replace(apiKey, "[redacted]")
+          : "Unknown error";
+      console.error("ImgBB upload failed:", message);
+      return res
+        .status(502)
+        .send({ message: "The image service could not upload this file." });
+    }
+  },
+);
+
+app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res) => {
+  const { data, error } = validateNewTuition(req.body);
+
+  if (error) {
+    return res.status(400).send({ message: error });
+  }
+
+  try {
+    const postsUsed = await tuitions.countDocuments({
+      tutorId: req.user._id,
+    });
+    const usage = getTutorPostUsage(req.user.plan, postsUsed);
+
+    if (!usage.canCreate) {
+      return res.status(403).send({
+        message:
+          "Free tutors can post up to 2 tuitions. Upgrade to Pro to post more.",
+        usage,
+      });
+    }
+
+    const now = new Date();
+    const tuition = {
+      ...data,
+      tutorId: req.user._id,
+      approvalStatus: "pending",
+      isActive: true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const result = await tuitions.insertOne(tuition);
+
+    return res.status(201).send({
+      id: result.insertedId.toString(),
+      ...tuition,
+      tutorId: req.user._id.toString(),
+      usage: getTutorPostUsage(req.user.plan, postsUsed + 1),
+    });
+  } catch (error) {
+    console.error("Failed to create tuition:", error);
+    return res.status(500).send({ message: "Unable to submit this tuition." });
   }
 });
 
