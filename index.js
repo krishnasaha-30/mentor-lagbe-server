@@ -10,6 +10,7 @@ import {
   verifyTutor,
 } from "./middleware/auth.js";
 import { parseTuitionsQuery } from "./lib/tuitions-query.js";
+import { validateAdminUserRole } from "./lib/admin-user-validation.js";
 import { validateTuitionApproval } from "./lib/admin-tuition-validation.js";
 import {
   validateApplicationDecision,
@@ -47,6 +48,116 @@ app.get("/", (req, res) => {
 app.get("/api/health", (req, res) => {
   res.send({ status: "ok" });
 });
+
+app.get(
+  "/api/admin/users",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const userRows = await users
+        .find(
+          { role: { $in: ["student", "tutor"] } },
+          {
+            projection: {
+              _id: 1,
+              name: 1,
+              email: 1,
+              role: 1,
+              plan: 1,
+              image: 1,
+            },
+          },
+        )
+        .sort({ name: 1, _id: 1 })
+        .toArray();
+
+      return res.send({
+        users: userRows.map((user) => ({
+          id: user._id.toString(),
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          plan: user.plan === "pro" ? "pro" : "free",
+          image: user.image ?? null,
+        })),
+      });
+    } catch (error) {
+      console.error("Failed to fetch admin users:", error);
+      return res.status(500).send({ message: "Unable to load users." });
+    }
+  },
+);
+
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { data, error } = validateAdminUserRole(req.params.id, req.body);
+
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+
+    try {
+      const userId = new ObjectId(data.id);
+      const result = await users.updateOne(
+        { _id: userId, role: { $in: ["student", "tutor"] } },
+        { $set: { role: data.role, updatedAt: new Date() } },
+      );
+
+      if (result.matchedCount === 0) {
+        const user = await users.findOne(
+          { _id: userId },
+          { projection: { _id: 1 } },
+        );
+
+        if (!user) {
+          return res.status(404).send({ message: "User not found." });
+        }
+
+        return res
+          .status(409)
+          .send({ message: "Admin account roles cannot be changed." });
+      }
+
+      return res.send({ id: data.id, role: data.role });
+    } catch (error) {
+      console.error("Failed to update admin user role:", error);
+      return res.status(500).send({ message: "Unable to update user role." });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/dashboard",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const [totalUsers, totalTutors, pendingTuitions, approvedTuitions] =
+        await Promise.all([
+          users.countDocuments({}),
+          users.countDocuments({ role: "tutor" }),
+          tuitions.countDocuments({ approvalStatus: "pending" }),
+          tuitions.countDocuments({ approvalStatus: "approved" }),
+        ]);
+
+      return res.send({
+        totalUsers,
+        totalTutors,
+        pendingTuitions,
+        approvedTuitions,
+      });
+    } catch (error) {
+      console.error("Failed to fetch admin dashboard summary:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to load admin dashboard statistics." });
+    }
+  },
+);
 
 app.get(
   "/api/applications/mine",
