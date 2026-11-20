@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { validateNewApplication } from "../lib/application-validation.js";
+import {
+  validateApplicationDecision,
+  validateNewApplication,
+} from "../lib/application-validation.js";
 
 const tuitionId = "507f1f77bcf86cd799439011";
 
@@ -46,5 +49,20 @@ test("rejects malformed IDs, missing fields, and oversized notes", () => {
       note: "x".repeat(1001),
     }).error,
     /note/,
+  );
+});
+
+test("validates applicant decisions and rejects all other statuses", () => {
+  assert.deepEqual(
+    validateApplicationDecision(tuitionId, { status: "accepted" }),
+    { data: { id: tuitionId, status: "accepted" } },
+  );
+  assert.deepEqual(
+    validateApplicationDecision(tuitionId, { status: "rejected" }),
+    { data: { id: tuitionId, status: "rejected" } },
+  );
+  assert.match(
+    validateApplicationDecision(tuitionId, { status: "pending" }).error,
+    /accepted or rejected/,
   );
 });

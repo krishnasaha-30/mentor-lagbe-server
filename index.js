@@ -11,7 +11,10 @@ import {
 } from "./middleware/auth.js";
 import { parseTuitionsQuery } from "./lib/tuitions-query.js";
 import { validateTuitionApproval } from "./lib/admin-tuition-validation.js";
-import { validateNewApplication } from "./lib/application-validation.js";
+import {
+  validateApplicationDecision,
+  validateNewApplication,
+} from "./lib/application-validation.js";
 import { validateTuitionActivity } from "./lib/tutor-tuition-validation.js";
 import {
   getTutorPostUsage,
@@ -200,6 +203,63 @@ app.delete(
   },
 );
 
+app.patch(
+  "/api/applications/:id/status",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    const { data, error } = validateApplicationDecision(
+      req.params.id,
+      req.body,
+    );
+
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+
+    try {
+      const tutorTuitions = await tuitions
+        .find({ tutorId: req.user._id }, { projection: { _id: 1 } })
+        .toArray();
+      const tuitionIds = tutorTuitions.map((tuition) => tuition._id);
+
+      if (tuitionIds.length === 0) {
+        return res.status(404).send({ message: "Application not found." });
+      }
+
+      const ownershipFilter = {
+        _id: new ObjectId(data.id),
+        tuitionId: { $in: tuitionIds },
+      };
+      const result = await applications.updateOne(
+        { ...ownershipFilter, status: "pending" },
+        { $set: { status: data.status, updatedAt: new Date() } },
+      );
+
+      if (result.matchedCount === 0) {
+        const application = await applications.findOne(ownershipFilter, {
+          projection: { status: 1 },
+        });
+
+        if (!application) {
+          return res.status(404).send({ message: "Application not found." });
+        }
+
+        return res
+          .status(409)
+          .send({ message: "Only pending applications can be reviewed." });
+      }
+
+      return res.send({ id: data.id, status: data.status });
+    } catch (error) {
+      console.error("Failed to update applicant status:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to update this applicant." });
+    }
+  },
+);
+
 app.get(
   "/api/tutor/dashboard",
   verifyToken,
@@ -312,6 +372,101 @@ app.get(
       return res
         .status(500)
         .send({ message: "Unable to load your tuition posting limit." });
+    }
+  },
+);
+
+app.get(
+  "/api/tutor/applications",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    try {
+      const tuitionRows = await tuitions
+        .find(
+          { tutorId: req.user._id },
+          { projection: { _id: 1, title: 1, subject: 1 } },
+        )
+        .toArray();
+      const tuitionIds = tuitionRows.map((tuition) => tuition._id);
+      const applicationRows = tuitionIds.length
+        ? await applications
+            .find(
+              { tuitionId: { $in: tuitionIds } },
+              {
+                projection: {
+                  _id: 1,
+                  tuitionId: 1,
+                  studentId: 1,
+                  status: 1,
+                  phone: 1,
+                  preferredSchedule: 1,
+                  note: 1,
+                  createdAt: 1,
+                },
+              },
+            )
+            .sort({ createdAt: -1, _id: -1 })
+            .toArray()
+        : [];
+      const studentIds = applicationRows
+        .map((application) => toObjectId(application.studentId))
+        .filter(Boolean);
+      const studentRows = studentIds.length
+        ? await users
+            .find(
+              { _id: { $in: studentIds }, role: "student" },
+              { projection: { _id: 1, name: 1, email: 1, image: 1 } },
+            )
+            .toArray()
+        : [];
+      const studentsById = new Map(
+        studentRows.map((student) => [student._id.toString(), student]),
+      );
+      const tuitionsById = new Map(
+        tuitionRows.map((tuition) => [tuition._id.toString(), tuition]),
+      );
+
+      return res.send({
+        applications: applicationRows.map((application) => {
+          const studentId = toObjectId(application.studentId)?.toString();
+          const student = studentId
+            ? studentsById.get(studentId)
+            : undefined;
+          const tuitionId = toObjectId(application.tuitionId)?.toString();
+          const tuition = tuitionId
+            ? tuitionsById.get(tuitionId)
+            : undefined;
+
+          return {
+            id: application._id.toString(),
+            status: application.status,
+            phone: application.phone,
+            preferredSchedule: application.preferredSchedule,
+            note: application.note ?? "",
+            createdAt: new Date(application.createdAt).toISOString(),
+            student: student
+              ? {
+                  name: student.name,
+                  email: student.email,
+                  image: student.image ?? null,
+                }
+              : null,
+            tuition: tuition
+              ? {
+                  id: tuition._id.toString(),
+                  title: tuition.title,
+                  subject: tuition.subject,
+                }
+              : null,
+          };
+        }),
+      });
+    } catch (error) {
+      console.error("Failed to fetch tutor applications:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to load your applicants." });
     }
   },
 );
