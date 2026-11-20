@@ -200,6 +200,102 @@ app.delete(
 );
 
 app.get(
+  "/api/tutor/dashboard",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    try {
+      const tuitionRows = await tuitions
+        .find(
+          { tutorId: req.user._id },
+          {
+            projection: {
+              _id: 1,
+              title: 1,
+              approvalStatus: 1,
+              isActive: 1,
+            },
+          },
+        )
+        .toArray();
+      const tuitionIds = tuitionRows.map((tuition) => tuition._id);
+      const applicantsCount = tuitionIds.length
+        ? await applications.countDocuments({
+            tuitionId: { $in: tuitionIds },
+          })
+        : 0;
+      const latestApplications = tuitionIds.length
+        ? await applications
+            .find(
+              { tuitionId: { $in: tuitionIds } },
+              {
+                projection: {
+                  _id: 1,
+                  studentId: 1,
+                  tuitionId: 1,
+                  status: 1,
+                },
+              },
+            )
+            .sort({ createdAt: -1, _id: -1 })
+            .limit(3)
+            .toArray()
+        : [];
+      const studentIds = latestApplications
+        .map((application) => toObjectId(application.studentId))
+        .filter(Boolean);
+      const students = studentIds.length
+        ? await users
+            .find(
+              { _id: { $in: studentIds }, role: "student" },
+              { projection: { _id: 1, name: 1, image: 1 } },
+            )
+            .toArray()
+        : [];
+      const studentsById = new Map(
+        students.map((student) => [student._id.toString(), student]),
+      );
+      const tuitionsById = new Map(
+        tuitionRows.map((tuition) => [tuition._id.toString(), tuition]),
+      );
+
+      return res.send({
+        tuitionsPosted: tuitionRows.length,
+        activeApproved: tuitionRows.filter(
+          (tuition) =>
+            tuition.approvalStatus === "approved" && tuition.isActive === true,
+        ).length,
+        applicantsCount,
+        latestApplicants: latestApplications.map((application) => {
+          const studentId = toObjectId(application.studentId)?.toString();
+          const student = studentId
+            ? studentsById.get(studentId)
+            : undefined;
+          const tuitionId = toObjectId(application.tuitionId)?.toString();
+          const tuition = tuitionId
+            ? tuitionsById.get(tuitionId)
+            : undefined;
+
+          return {
+            id: application._id.toString(),
+            student: student
+              ? { name: student.name, image: student.image ?? null }
+              : null,
+            tuitionTitle: tuition?.title ?? "Tuition unavailable",
+            status: application.status,
+          };
+        }),
+      });
+    } catch (error) {
+      console.error("Failed to fetch tutor dashboard summary:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to load your tutor dashboard." });
+    }
+  },
+);
+
+app.get(
   "/api/tuitions/mine/usage",
   verifyToken,
   verifyTutor,
