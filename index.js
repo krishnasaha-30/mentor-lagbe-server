@@ -12,6 +12,7 @@ import {
 import { parseTuitionsQuery } from "./lib/tuitions-query.js";
 import { validateAdminUserRole } from "./lib/admin-user-validation.js";
 import { validateTuitionApproval } from "./lib/admin-tuition-validation.js";
+import { validateProfileUpdate } from "./lib/profile-validation.js";
 import {
   validateApplicationDecision,
   validateNewApplication,
@@ -1103,6 +1104,61 @@ function hasValidImageSignature(buffer, contentType) {
   );
 }
 
+async function uploadImageToImgBB(buffer, contentType, filename) {
+  const apiKey = process.env.IMGBB_API_KEY;
+
+  if (!apiKey) {
+    return {
+      error: {
+        status: 503,
+        message: "Image uploads are not configured on the server.",
+      },
+    };
+  }
+
+  const imageForm = new FormData();
+  imageForm.set("image", new Blob([buffer], { type: contentType }), filename);
+
+  try {
+    const url = new URL("https://api.imgbb.com/1/upload");
+    url.searchParams.set("key", apiKey);
+
+    const uploadResponse = await fetch(url, {
+      method: "POST",
+      body: imageForm,
+    });
+
+    const uploadResult = await uploadResponse.json();
+
+    if (
+      !uploadResponse.ok ||
+      uploadResult.success !== true ||
+      typeof uploadResult.data?.url !== "string"
+    ) {
+      return {
+        error: {
+          status: 502,
+          message: "The image service could not upload this file.",
+        },
+      };
+    }
+
+    return { url: uploadResult.data.url };
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message.replace(apiKey, "[redacted]")
+        : "Unknown error";
+    console.error("ImgBB upload failed:", message);
+    return {
+      error: {
+        status: 502,
+        message: "The image service could not upload this file.",
+      },
+    };
+  }
+}
+
 app.post(
   "/api/tuitions/banner",
   verifyToken,
@@ -1177,45 +1233,53 @@ app.post(
     }
 
     const fileExtension = contentType === "image/png" ? "png" : "jpg";
-    const imageForm = new FormData();
-    imageForm.set(
-      "image",
-      new Blob([req.body], { type: contentType }),
+    const result = await uploadImageToImgBB(
+      req.body,
+      contentType,
       `tuition-banner.${fileExtension}`,
     );
 
-    try {
-      const url = new URL("https://api.imgbb.com/1/upload");
-      url.searchParams.set("key", apiKey);
-
-      const uploadResponse = await fetch(url, {
-        method: "POST",
-        body: imageForm,
+    if (result.error) {
+      return res.status(result.error.status).send({
+        message: result.error.message,
       });
-
-      const uploadResult = await uploadResponse.json();
-
-      if (
-        !uploadResponse.ok ||
-        uploadResult.success !== true ||
-        typeof uploadResult.data?.url !== "string"
-      ) {
-        return res
-          .status(502)
-          .send({ message: "The image service could not upload this file." });
-      }
-
-      return res.send({ url: uploadResult.data.url });
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message.replace(apiKey, "[redacted]")
-          : "Unknown error";
-      console.error("ImgBB upload failed:", message);
-      return res
-        .status(502)
-        .send({ message: "The image service could not upload this file." });
     }
+
+    return res.send({ url: result.url });
+  },
+);
+
+app.post(
+  "/api/me/image",
+  verifyToken,
+  handleBannerImageBody,
+  async (req, res) => {
+    const contentType = req.headers["content-type"]?.split(";")[0];
+
+    if (
+      !Buffer.isBuffer(req.body) ||
+      req.body.length === 0 ||
+      !hasValidImageSignature(req.body, contentType)
+    ) {
+      return res
+        .status(400)
+        .send({ message: "Choose a valid JPG or PNG image." });
+    }
+
+    const fileExtension = contentType === "image/png" ? "png" : "jpg";
+    const result = await uploadImageToImgBB(
+      req.body,
+      contentType,
+      `profile-photo.${fileExtension}`,
+    );
+
+    if (result.error) {
+      return res.status(result.error.status).send({
+        message: result.error.message,
+      });
+    }
+
+    return res.send({ url: result.url });
   },
 );
 
@@ -1265,8 +1329,47 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res) => {
 
 // Shared: the signed-in user's own profile.
 app.get("/api/me", verifyToken, (req, res) => {
-  const { _id, name, email, role, plan, image } = req.user;
-  res.send({ _id, name, email, role, plan, image });
+  const { _id, name, email, role, plan, image, phone, bio } = req.user;
+  res.send({
+    _id: _id.toString(),
+    id: _id.toString(),
+    name,
+    email,
+    role,
+    plan,
+    image: image ?? null,
+    phone: phone ?? "",
+    bio: bio ?? "",
+  });
+});
+
+app.patch("/api/me/profile", verifyToken, async (req, res) => {
+  const { data, error } = validateProfileUpdate(req.body);
+
+  if (error) {
+    return res.status(400).send({ message: error });
+  }
+
+  try {
+    const result = await users.updateOne(
+      { _id: req.user._id },
+      { $set: { ...data, updatedAt: new Date() } },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "User not found." });
+    }
+
+    return res.send({
+      id: req.user._id.toString(),
+      ...data,
+      email: req.user.email,
+      role: req.user.role,
+    });
+  } catch (error) {
+    console.error("Failed to update user profile:", error);
+    return res.status(500).send({ message: "Unable to update your profile." });
+  }
 });
 
 app.listen(PORT, () => {
