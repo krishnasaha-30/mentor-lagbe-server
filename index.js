@@ -12,6 +12,7 @@ import {
 import { parseTuitionsQuery } from "./lib/tuitions-query.js";
 import { validateTuitionApproval } from "./lib/admin-tuition-validation.js";
 import { validateNewApplication } from "./lib/application-validation.js";
+import { validateTuitionActivity } from "./lib/tutor-tuition-validation.js";
 import {
   getTutorPostUsage,
   validateNewTuition,
@@ -314,6 +315,55 @@ app.get(
     }
   },
 );
+
+app.get("/api/tuitions/mine", verifyToken, verifyTutor, async (req, res) => {
+  try {
+    const tuitionRows = await tuitions
+      .find(
+        { tutorId: req.user._id },
+        {
+          projection: {
+            _id: 1,
+            title: 1,
+            subject: 1,
+            classLevel: 1,
+            mode: 1,
+            location: 1,
+            monthlyFee: 1,
+            daysPerWeek: 1,
+            description: 1,
+            bannerImage: 1,
+            approvalStatus: 1,
+            isActive: 1,
+            createdAt: 1,
+          },
+        },
+      )
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    return res.send({
+      tuitions: tuitionRows.map((tuition) => ({
+        id: tuition._id.toString(),
+        title: tuition.title,
+        subject: tuition.subject,
+        classLevel: tuition.classLevel,
+        mode: tuition.mode,
+        location: tuition.location,
+        monthlyFee: tuition.monthlyFee,
+        daysPerWeek: tuition.daysPerWeek,
+        description: tuition.description,
+        bannerImage: tuition.bannerImage ?? null,
+        approvalStatus: tuition.approvalStatus,
+        isActive: tuition.isActive === true,
+        createdAt: new Date(tuition.createdAt).toISOString(),
+      })),
+    });
+  } catch (error) {
+    console.error("Failed to fetch tutor tuitions:", error);
+    return res.status(500).send({ message: "Unable to load your tuitions." });
+  }
+});
 
 // Public listings only include approved, active tuitions.
 app.get("/api/tuitions", async (req, res) => {
@@ -652,6 +702,106 @@ app.patch(
   },
 );
 
+app.patch(
+  "/api/tuitions/:id/activity",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    const { data, error } = validateTuitionActivity(req.params.id, req.body);
+
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+
+    try {
+      const result = await tuitions.updateOne(
+        { _id: new ObjectId(data.id), tutorId: req.user._id },
+        { $set: { isActive: data.isActive, updatedAt: new Date() } },
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).send({ message: "Tuition not found." });
+      }
+
+      return res.send({ id: data.id, isActive: data.isActive });
+    } catch (error) {
+      console.error("Failed to update tuition activity:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to update tuition status." });
+    }
+  },
+);
+
+app.patch(
+  "/api/tuitions/:id",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    const { data, error } = validateNewTuition(req.body);
+
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) {
+      return res.status(400).send({ message: "Invalid tuition ID." });
+    }
+
+    try {
+      const result = await tuitions.updateOne(
+        { _id: new ObjectId(req.params.id), tutorId: req.user._id },
+        {
+          $set: {
+            ...data,
+            approvalStatus: "pending",
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).send({ message: "Tuition not found." });
+      }
+
+      return res.send({
+        id: req.params.id,
+        approvalStatus: "pending",
+      });
+    } catch (error) {
+      console.error("Failed to update tutor tuition:", error);
+      return res.status(500).send({ message: "Unable to update this tuition." });
+    }
+  },
+);
+
+app.delete(
+  "/api/tuitions/:id",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) {
+      return res.status(400).send({ message: "Invalid tuition ID." });
+    }
+
+    try {
+      const result = await tuitions.deleteOne({
+        _id: new ObjectId(req.params.id),
+        tutorId: req.user._id,
+      });
+
+      if (result.deletedCount === 0) {
+        return res.status(404).send({ message: "Tuition not found." });
+      }
+
+      return res.send({ id: req.params.id, deleted: true });
+    } catch (error) {
+      console.error("Failed to delete tutor tuition:", error);
+      return res.status(500).send({ message: "Unable to delete this tuition." });
+    }
+  },
+);
+
 const parseBannerImage = express.raw({
   type: ["image/png", "image/jpeg"],
   limit: "2mb",
@@ -713,24 +863,51 @@ app.post(
         .send({ message: "Choose a valid JPG or PNG image." });
     }
 
-    let postsUsed;
+    const tuitionIdForEdit = req.headers["x-tuition-id"];
 
-    try {
-      postsUsed = await tuitions.countDocuments({
-        tutorId: req.user._id,
-      });
-    } catch (error) {
-      console.error("Failed to check tutor tuition usage:", error);
-      return res
-        .status(500)
-        .send({ message: "Unable to check your tuition posting limit." });
-    }
+    if (tuitionIdForEdit !== undefined) {
+      if (
+        typeof tuitionIdForEdit !== "string" ||
+        !/^[a-f\d]{24}$/i.test(tuitionIdForEdit)
+      ) {
+        return res.status(400).send({ message: "Invalid tuition ID." });
+      }
 
-    if (!getTutorPostUsage(req.user.plan, postsUsed).canCreate) {
-      return res.status(403).send({
-        message:
-          "Free tutors can post up to 2 tuitions. Upgrade to Pro to post more.",
-      });
+      try {
+        const tuition = await tuitions.findOne({
+          _id: new ObjectId(tuitionIdForEdit),
+          tutorId: req.user._id,
+        });
+
+        if (!tuition) {
+          return res.status(404).send({ message: "Tuition not found." });
+        }
+      } catch (error) {
+        console.error("Failed to verify tuition banner ownership:", error);
+        return res
+          .status(500)
+          .send({ message: "Unable to verify tuition ownership." });
+      }
+    } else {
+      let postsUsed;
+
+      try {
+        postsUsed = await tuitions.countDocuments({
+          tutorId: req.user._id,
+        });
+      } catch (error) {
+        console.error("Failed to check tutor tuition usage:", error);
+        return res
+          .status(500)
+          .send({ message: "Unable to check your tuition posting limit." });
+      }
+
+      if (!getTutorPostUsage(req.user.plan, postsUsed).canCreate) {
+        return res.status(403).send({
+          message:
+            "Free tutors can post up to 2 tuitions. Upgrade to Pro to post more.",
+        });
+      }
     }
 
     const fileExtension = contentType === "image/png" ? "png" : "jpg";
