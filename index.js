@@ -45,6 +45,161 @@ app.get("/api/health", (req, res) => {
 });
 
 app.get(
+  "/api/applications/mine",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    try {
+      const applicationRows = await applications
+        .find(
+          { studentId: req.user._id },
+          {
+            projection: {
+              _id: 1,
+              tuitionId: 1,
+              status: 1,
+              phone: 1,
+              preferredSchedule: 1,
+              note: 1,
+              createdAt: 1,
+            },
+          },
+        )
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray();
+      const tuitionIds = [
+        ...new Map(
+          applicationRows
+            .map((application) => toObjectId(application.tuitionId))
+            .filter(Boolean)
+            .map((id) => [id.toString(), id]),
+        ).values(),
+      ];
+      const tuitionRows = tuitionIds.length
+        ? await tuitions
+            .find(
+              { _id: { $in: tuitionIds } },
+              {
+                projection: {
+                  _id: 1,
+                  title: 1,
+                  subject: 1,
+                  classLevel: 1,
+                  monthlyFee: 1,
+                  tutorId: 1,
+                  approvalStatus: 1,
+                  isActive: 1,
+                },
+              },
+            )
+            .toArray()
+        : [];
+      const tutorIds = tuitionRows
+        .map((tuition) => toObjectId(tuition.tutorId))
+        .filter(Boolean);
+      const tutorRows = tutorIds.length
+        ? await users
+            .find(
+              { _id: { $in: tutorIds }, role: "tutor" },
+              { projection: { _id: 1, name: 1, image: 1 } },
+            )
+            .toArray()
+        : [];
+      const tutorsById = new Map(
+        tutorRows.map((tutor) => [tutor._id.toString(), tutor]),
+      );
+      const tuitionsById = new Map(
+        tuitionRows.map((tuition) => {
+          const tutorId = toObjectId(tuition.tutorId)?.toString();
+          const tutor = tutorId ? tutorsById.get(tutorId) : undefined;
+
+          return [
+            tuition._id.toString(),
+            {
+              id: tuition._id.toString(),
+              title: tuition.title,
+              subject: tuition.subject,
+              classLevel: tuition.classLevel,
+              monthlyFee: tuition.monthlyFee,
+              isPublic:
+                tuition.approvalStatus === "approved" && tuition.isActive,
+              tutor: tutor
+                ? { name: tutor.name, image: tutor.image ?? null }
+                : null,
+            },
+          ];
+        }),
+      );
+
+      return res.send({
+        applications: applicationRows.map((application) => {
+          const tuitionId = toObjectId(application.tuitionId)?.toString();
+          const createdAt = new Date(application.createdAt);
+
+          return {
+            id: application._id.toString(),
+            status: application.status,
+            phone: application.phone,
+            preferredSchedule: application.preferredSchedule,
+            note: application.note ?? "",
+            createdAt: createdAt.toISOString(),
+            tuition: tuitionId ? (tuitionsById.get(tuitionId) ?? null) : null,
+          };
+        }),
+      });
+    } catch (error) {
+      console.error("Failed to fetch student applications:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to load your applications." });
+    }
+  },
+);
+
+app.delete(
+  "/api/applications/:id",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) {
+      return res.status(400).send({ message: "Invalid application ID." });
+    }
+
+    const applicationId = new ObjectId(req.params.id);
+
+    try {
+      const result = await applications.deleteOne({
+        _id: applicationId,
+        studentId: req.user._id,
+        status: "pending",
+      });
+
+      if (result.deletedCount === 0) {
+        const application = await applications.findOne(
+          { _id: applicationId, studentId: req.user._id },
+          { projection: { status: 1 } },
+        );
+
+        if (!application) {
+          return res.status(404).send({ message: "Application not found." });
+        }
+
+        return res.status(409).send({
+          message: "Only pending applications can be cancelled.",
+        });
+      }
+
+      return res.send({ id: req.params.id, cancelled: true });
+    } catch (error) {
+      console.error("Failed to cancel student application:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to cancel this application." });
+    }
+  },
+);
+
+app.get(
   "/api/tuitions/mine/usage",
   verifyToken,
   verifyTutor,
