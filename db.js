@@ -15,3 +15,10 @@ export const users = database.collection("user");
 export const sessions = database.collection("session");
 export const tuitions = database.collection("tuitions");
 export const applications = database.collection("applications");
+export const stripeEvents = database.collection("stripeEvents");
+export const payments = database.collection("payments");
+await stripeEvents.createIndex(
+  { createdAt: 1 },
+  { expireAfterSeconds: 90 * 24 * 60 * 60 },
+);
+await payments.createIndex({ status: 1, createdAt: -1 });

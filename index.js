@@ -1,8 +1,15 @@
 import express from "express";
 import cors from "cors";
 import { ObjectId } from "mongodb";
+import Stripe from "stripe";
 
-import { applications, tuitions, users } from "./db.js";
+import {
+  applications,
+  payments,
+  stripeEvents,
+  tuitions,
+  users,
+} from "./db.js";
 import {
   verifyStudent,
   verifyToken,
@@ -22,6 +29,14 @@ import {
   getTutorPostUsage,
   validateNewTuition,
 } from "./lib/tuition-validation.js";
+import {
+  getPlanForRole,
+  isSubscriptionEntitled,
+  resolveSubscriptionPlan,
+  validateSubscriptionCheckout,
+} from "./lib/billing-validation.js";
+import { prioritizeProStudentApplications } from "./lib/application-priority.js";
+import { validatePaidInvoice } from "./lib/payment-validation.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -38,8 +53,365 @@ function toObjectId(value) {
   return new ObjectId(value);
 }
 
+let stripeClient;
+let stripeClientKey;
+
+function getStripeClient() {
+  const key = process.env.STRIPE_SECRET_KEY || process.env.STRIPE_API_KEY;
+
+  if (!key) {
+    return null;
+  }
+
+  if (!stripeClient || stripeClientKey !== key) {
+    stripeClient = new Stripe(key);
+    stripeClientKey = key;
+  }
+
+  return stripeClient;
+}
+
+function getStripeErrorDetails(error) {
+  const message = error instanceof Error ? error.message : "Unknown error";
+  const key = process.env.STRIPE_SECRET_KEY || process.env.STRIPE_API_KEY;
+
+  return key ? message.split(key).join("[redacted]") : message;
+}
+
+function getStripeReferenceId(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  return typeof value?.id === "string" ? value.id : null;
+}
+
+async function syncSubscriptionToUser(stripe, event) {
+  const subscriptionId = event.data.object?.id;
+
+  if (typeof subscriptionId !== "string") {
+    console.error(
+      "Ignoring Stripe subscription event without a subscription ID.",
+    );
+    return;
+  }
+
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  return syncSubscriptionRecord(subscription, event.created);
+}
+
+async function syncSubscriptionRecord(subscription, eventCreated) {
+  const plan = subscription.metadata?.plan;
+  const userIdValue = subscription.metadata?.userId;
+
+  if (
+    (plan !== "pro_tutor" && plan !== "pro_student") ||
+    typeof userIdValue !== "string"
+  ) {
+    console.warn(
+      "Ignoring a Stripe subscription without MentorLagbe metadata.",
+    );
+    return;
+  }
+
+  const priceIds = {
+    pro_tutor: process.env.STRIPE_PRO_TUTOR_PRICE_ID,
+    pro_student: process.env.STRIPE_PRO_STUDENT_PRICE_ID,
+  };
+
+  if (typeof priceIds[plan] !== "string") {
+    throw new Error(`Stripe price is not configured for plan "${plan}".`);
+  }
+
+  const result = resolveSubscriptionPlan(subscription, priceIds);
+
+  if (result.error) {
+    throw new Error(`Stripe price does not match plan "${plan}".`);
+  }
+
+  const userId = toObjectId(result.data.userId);
+  const customerId = getStripeReferenceId(subscription.customer);
+
+  if (!userId || typeof customerId !== "string") {
+    console.error(
+      "Ignoring Stripe subscription with invalid user or customer ID.",
+    );
+    return;
+  }
+
+  const user = await users.findOne(
+    { _id: userId },
+    {
+      projection: {
+        role: 1,
+        stripeSubscriptionId: 1,
+        stripeSubscriptionStatus: 1,
+        stripeSubscriptionEventCreated: 1,
+      },
+    },
+  );
+
+  if (!user) {
+    console.error(
+      "Ignoring Stripe subscription for a user that no longer exists.",
+    );
+    return;
+  }
+
+  if (typeof eventCreated !== "number") {
+    throw new Error("Stripe subscription event has no creation timestamp.");
+  }
+
+  const hasNewerEvent =
+    typeof user.stripeSubscriptionEventCreated === "number" &&
+    user.stripeSubscriptionEventCreated > eventCreated;
+  const hasDifferentActiveSubscription =
+    user.stripeSubscriptionId &&
+    user.stripeSubscriptionId !== subscription.id &&
+    isSubscriptionEntitled(user.stripeSubscriptionStatus);
+
+  if (hasNewerEvent || hasDifferentActiveSubscription) {
+    return false;
+  }
+
+  const entitled =
+    user.role === result.data.role &&
+    isSubscriptionEntitled(subscription.status);
+  const updateResult = await users.updateOne(
+    {
+      _id: userId,
+      $and: [
+        {
+          $or: [
+            { stripeSubscriptionId: subscription.id },
+            {
+              stripeSubscriptionStatus: {
+                $nin: ["active", "trialing", "past_due"],
+              },
+            },
+            { stripeSubscriptionId: { $exists: false } },
+          ],
+        },
+        {
+          $or: [
+            { stripeSubscriptionEventCreated: { $lte: eventCreated } },
+            { stripeSubscriptionEventCreated: { $exists: false } },
+          ],
+        },
+      ],
+    },
+    {
+      $set: {
+        plan: entitled ? "pro" : "free",
+        stripeCustomerId: customerId,
+        stripeSubscriptionId: subscription.id,
+        stripeSubscriptionPlan: result.data.plan,
+        stripeSubscriptionStatus: subscription.status,
+        stripeSubscriptionEventCreated: eventCreated,
+        updatedAt: new Date(),
+      },
+    },
+  );
+
+  if (updateResult.matchedCount === 0) {
+    console.warn("Skipped an outdated Stripe subscription update.");
+  }
+
+  return updateResult.matchedCount > 0 && entitled;
+}
+
+async function recordPaidInvoice(stripe, invoice, eventCreated) {
+  const validation = validatePaidInvoice(invoice);
+
+  if (validation.error) {
+    throw new Error(validation.error);
+  }
+
+  if (!validation.data) {
+    return;
+  }
+
+  const subscriptionId =
+    getStripeReferenceId(invoice.parent?.subscription_details?.subscription) ||
+    getStripeReferenceId(invoice.subscription);
+
+  if (!subscriptionId) {
+    console.warn("Ignoring a paid Stripe invoice without a subscription.");
+    return;
+  }
+
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const plan = subscription.metadata?.plan;
+  const userId = toObjectId(subscription.metadata?.userId);
+  const customerId = getStripeReferenceId(invoice.customer);
+  const subscriptionCustomerId = getStripeReferenceId(subscription.customer);
+  const priceIds = {
+    pro_tutor: process.env.STRIPE_PRO_TUTOR_PRICE_ID,
+    pro_student: process.env.STRIPE_PRO_STUDENT_PRICE_ID,
+  };
+
+  if (plan !== "pro_tutor" && plan !== "pro_student") {
+    console.warn("Ignoring a paid Stripe invoice without MentorLagbe plan metadata.");
+    return;
+  }
+
+  if (typeof priceIds[plan] !== "string") {
+    throw new Error(`Stripe price is not configured for plan "${plan}".`);
+  }
+
+  const resolvedPlan = resolveSubscriptionPlan(subscription, priceIds);
+
+  if (resolvedPlan.error) {
+    throw new Error(`Stripe price does not match plan "${plan}".`);
+  }
+
+  if (
+    !userId ||
+    !customerId ||
+    customerId !== subscriptionCustomerId ||
+    resolvedPlan.data.userId !== userId.toString()
+  ) {
+    console.warn("Ignoring a paid Stripe invoice with mismatched account details.");
+    return;
+  }
+
+  const user = await users.findOne(
+    { _id: userId, stripeCustomerId: customerId },
+    { projection: { _id: 1 } },
+  );
+
+  if (!user) {
+    console.warn("Ignoring a paid Stripe invoice for an unknown MentorLagbe account.");
+    return;
+  }
+
+  await syncSubscriptionRecord(subscription, eventCreated);
+
+  const paidAt = invoice.status_transitions?.paid_at ?? eventCreated;
+
+  if (typeof paidAt !== "number") {
+    throw new Error("Stripe paid invoice has no payment timestamp.");
+  }
+
+  await payments.updateOne(
+    { _id: validation.data.invoiceId },
+    {
+      $setOnInsert: {
+        _id: validation.data.invoiceId,
+        userId,
+        plan,
+        subscriptionId,
+        customerId,
+        amountMinor: validation.data.amountMinor,
+        currency: validation.data.currency,
+        status: "paid",
+        invoiceUrl: invoice.hosted_invoice_url ?? null,
+        createdAt: new Date(paidAt * 1000),
+      },
+    },
+    { upsert: true },
+  );
+}
+
+async function handleStripeWebhook(req, res) {
+  const stripe = getStripeClient();
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const signature = req.headers["stripe-signature"];
+
+  if (!stripe || !webhookSecret) {
+    return res
+      .status(503)
+      .send({ message: "Stripe webhooks are not configured on the server." });
+  }
+
+  if (!Buffer.isBuffer(req.body) || typeof signature !== "string") {
+    return res.status(400).send({ message: "Invalid Stripe webhook request." });
+  }
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
+  } catch {
+    return res
+      .status(400)
+      .send({ message: "Invalid Stripe webhook signature." });
+  }
+
+  try {
+    const existingEvent = await stripeEvents.findOne({ _id: event.id });
+
+    if (existingEvent?.status === "processed") {
+      return res.send({ received: true });
+    }
+
+    if (!existingEvent) {
+      await stripeEvents.insertOne({
+        _id: event.id,
+        status: "processing",
+        createdAt: new Date(),
+      });
+    }
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res
+        .status(500)
+        .send({ message: "Stripe webhook processing is still in progress." });
+    }
+
+    console.error(
+      "Failed to record Stripe webhook:",
+      getStripeErrorDetails(error),
+    );
+    return res
+      .status(500)
+      .send({ message: "Unable to process the Stripe webhook." });
+  }
+
+  try {
+    if (
+      event.type === "customer.subscription.created" ||
+      event.type === "customer.subscription.updated" ||
+      event.type === "customer.subscription.deleted"
+    ) {
+      await syncSubscriptionToUser(stripe, event);
+    } else if (event.type === "invoice.paid") {
+      await recordPaidInvoice(stripe, event.data.object, event.created);
+    }
+
+    await stripeEvents.updateOne(
+      { _id: event.id },
+      { $set: { status: "processed", processedAt: new Date() } },
+    );
+
+    return res.send({ received: true });
+  } catch (error) {
+    try {
+      await stripeEvents.deleteOne({ _id: event.id, status: "processing" });
+    } catch (cleanupError) {
+      console.error(
+        "Failed to clean up Stripe webhook state:",
+        getStripeErrorDetails(cleanupError),
+      );
+    }
+
+    console.error(
+      "Failed to process Stripe webhook:",
+      getStripeErrorDetails(error),
+    );
+    return res
+      .status(500)
+      .send({ message: "Unable to process the Stripe webhook." });
+  }
+}
+
 // middleware
 app.use(cors());
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  handleStripeWebhook,
+);
 app.use(express.json());
 
 app.get("/", (req, res) => {
@@ -50,11 +422,290 @@ app.get("/api/health", (req, res) => {
   res.send({ status: "ok" });
 });
 
-app.get(
-  "/api/admin/users",
-  verifyToken,
-  verifyAdmin,
-  async (req, res) => {
+app.get("/api/public/stats", async (req, res) => {
+  try {
+    const activeTuitionFilter = {
+      approvalStatus: "approved",
+      isActive: true,
+    };
+    const [tutors, activeTuitions, subjectNames, acceptedApplications] =
+      await Promise.all([
+        users.countDocuments({ role: "tutor" }),
+        tuitions.countDocuments(activeTuitionFilter),
+        tuitions.distinct("subject", activeTuitionFilter),
+        applications.countDocuments({ status: "accepted" }),
+      ]);
+
+    return res.send({
+      tutors,
+      activeTuitions,
+      subjects: subjectNames.length,
+      acceptedApplications,
+    });
+  } catch (error) {
+    console.error("Failed to fetch public platform statistics:", error);
+    return res
+      .status(500)
+      .send({ message: "Unable to load platform statistics." });
+  }
+});
+
+app.post("/api/billing/checkout", verifyToken, async (req, res) => {
+  const { data, error, status } = validateSubscriptionCheckout(
+    req.user.role,
+    req.body,
+  );
+
+  if (error) {
+    return res.status(status || 400).send({ message: error });
+  }
+
+  if (req.user.plan === "pro") {
+    return res.status(409).send({
+      message: "You already have Pro. Use the billing portal to manage it.",
+    });
+  }
+
+  const stripe = getStripeClient();
+  const priceId = process.env[data.priceEnv];
+
+  if (!stripe || !priceId) {
+    return res.status(503).send({
+      message: "Stripe subscriptions are not configured on the server.",
+    });
+  }
+
+  try {
+    let customerId = req.user.stripeCustomerId;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create(
+        {
+          email: req.user.email,
+          name: req.user.name,
+          metadata: { userId: req.user._id.toString() },
+        },
+        { idempotencyKey: `mentorlagbe-customer-${req.user._id}` },
+      );
+      customerId = customer.id;
+      await users.updateOne(
+        { _id: req.user._id },
+        { $set: { stripeCustomerId: customerId } },
+      );
+    }
+
+    const subscriptions = await stripe.subscriptions.list({
+      customer: customerId,
+      status: "all",
+      limit: 100,
+    });
+    const hasCurrentSubscription = subscriptions.data.some((subscription) =>
+      isSubscriptionEntitled(subscription.status),
+    );
+
+    if (hasCurrentSubscription) {
+      return res.status(409).send({
+        message: "You already have an active subscription to manage.",
+      });
+    }
+
+    const clientUrl = (
+      process.env.CLIENT_URL || "http://localhost:3000"
+    ).replace(/\/+$/, "");
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: customerId,
+      client_reference_id: req.user._id.toString(),
+      line_items: [{ price: priceId, quantity: 1 }],
+      metadata: {
+        plan: data.plan,
+        userId: req.user._id.toString(),
+      },
+      subscription_data: {
+        metadata: {
+          plan: data.plan,
+          userId: req.user._id.toString(),
+        },
+      },
+      success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${clientUrl}/payment/cancel`,
+    });
+
+    if (!session.url) {
+      return res
+        .status(502)
+        .send({ message: "Stripe did not return a checkout URL." });
+    }
+
+    return res.send({ url: session.url });
+  } catch (error) {
+    console.error(
+      "Failed to create Stripe Checkout session:",
+      getStripeErrorDetails(error),
+    );
+    return res
+      .status(502)
+      .send({ message: "Unable to start checkout. Please try again." });
+  }
+});
+
+app.post("/api/billing/checkout/verify", verifyToken, async (req, res) => {
+  const sessionId = req.body?.sessionId;
+
+  if (typeof sessionId !== "string" || !sessionId.startsWith("cs_")) {
+    return res.status(400).send({ message: "A valid Checkout Session is required." });
+  }
+
+  const stripe = getStripeClient();
+
+  if (!stripe) {
+    return res.status(503).send({
+      message: "Stripe subscriptions are not configured on the server.",
+    });
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const userId = req.user._id.toString();
+    const customerId = getStripeReferenceId(session.customer);
+    const subscriptionId = getStripeReferenceId(session.subscription);
+
+    if (
+      session.client_reference_id !== userId ||
+      session.metadata?.userId !== userId ||
+      !req.user.stripeCustomerId ||
+      customerId !== req.user.stripeCustomerId
+    ) {
+      return res.status(404).send({ message: "Checkout Session not found." });
+    }
+
+    if (session.status !== "complete" || session.payment_status !== "paid") {
+      return res.status(409).send({
+        message: "Stripe has not confirmed this payment yet. Please try again.",
+      });
+    }
+
+    if (!subscriptionId) {
+      return res.status(409).send({
+        message: "The subscription is not available yet. Please try again.",
+      });
+    }
+
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+    const expectedPlan = session.metadata?.plan;
+    const subscriptionCustomerId = getStripeReferenceId(subscription.customer);
+
+    if (
+      subscription.metadata?.userId !== userId ||
+      subscription.metadata?.plan !== expectedPlan ||
+      customerId !== subscriptionCustomerId
+    ) {
+      return res.status(404).send({ message: "Checkout Session not found." });
+    }
+
+    const priceIds = {
+      pro_tutor: process.env.STRIPE_PRO_TUTOR_PRICE_ID,
+      pro_student: process.env.STRIPE_PRO_STUDENT_PRICE_ID,
+    };
+
+    if (expectedPlan !== "pro_tutor" && expectedPlan !== "pro_student") {
+      return res.status(404).send({ message: "Checkout Session not found." });
+    }
+
+    if (typeof priceIds[expectedPlan] !== "string") {
+      throw new Error(`Stripe price is not configured for plan "${expectedPlan}".`);
+    }
+
+    const resolvedPlan = resolveSubscriptionPlan(subscription, priceIds);
+
+    if (
+      resolvedPlan.error ||
+      resolvedPlan.data.userId !== userId ||
+      resolvedPlan.data.plan !== expectedPlan
+    ) {
+      return res.status(404).send({ message: "Checkout Session not found." });
+    }
+
+    const synced = await syncSubscriptionRecord(
+      subscription,
+      Math.floor(Date.now() / 1000),
+    );
+
+    if (!synced) {
+      return res.status(409).send({
+        message: "The subscription could not be activated. Please contact support.",
+      });
+    }
+
+    const invoiceId =
+      getStripeReferenceId(session.invoice) ||
+      getStripeReferenceId(subscription.latest_invoice);
+
+    if (!invoiceId) {
+      return res.status(409).send({
+        message: "Payment is confirmed; the invoice is still being prepared.",
+      });
+    }
+
+    const invoice = await stripe.invoices.retrieve(invoiceId);
+
+    if (invoice.status !== "paid") {
+      return res.status(409).send({
+        message: "Stripe has not confirmed the invoice yet. Please try again.",
+      });
+    }
+
+    await recordPaidInvoice(stripe, invoice, Math.floor(Date.now() / 1000));
+
+    return res.send({ verified: true, plan: expectedPlan });
+  } catch (error) {
+    console.error(
+      "Failed to verify Stripe Checkout session:",
+      getStripeErrorDetails(error),
+    );
+    return res
+      .status(502)
+      .send({ message: "Unable to verify payment. Please try again." });
+  }
+});
+
+app.post("/api/billing/portal", verifyToken, async (req, res) => {
+  const stripe = getStripeClient();
+
+  if (!stripe) {
+    return res.status(503).send({
+      message: "Stripe subscriptions are not configured on the server.",
+    });
+  }
+
+  if (!req.user.stripeCustomerId) {
+    return res
+      .status(409)
+      .send({ message: "No Stripe subscription is linked to this account." });
+  }
+
+  try {
+    const clientUrl = (
+      process.env.CLIENT_URL || "http://localhost:3000"
+    ).replace(/\/+$/, "");
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: req.user.stripeCustomerId,
+      return_url: `${clientUrl}/dashboard`,
+    });
+
+    return res.send({ url: portal.url });
+  } catch (error) {
+    console.error(
+      "Failed to create Stripe billing portal session:",
+      getStripeErrorDetails(error),
+    );
+    return res
+      .status(502)
+      .send({ message: "Unable to open billing settings. Please try again." });
+  }
+});
+
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
     try {
       const userRows = await users
         .find(
@@ -66,6 +717,7 @@ app.get(
               email: 1,
               role: 1,
               plan: 1,
+            stripeSubscriptionPlan: 1,
               image: 1,
             },
           },
@@ -79,7 +731,7 @@ app.get(
           name: user.name,
           email: user.email,
           role: user.role,
-          plan: user.plan === "pro" ? "pro" : "free",
+        plan: getPlanForRole(user, user.role),
           image: user.image ?? null,
         })),
       });
@@ -87,8 +739,7 @@ app.get(
       console.error("Failed to fetch admin users:", error);
       return res.status(500).send({ message: "Unable to load users." });
     }
-  },
-);
+});
 
 app.patch(
   "/api/admin/users/:id/role",
@@ -103,24 +754,60 @@ app.patch(
 
     try {
       const userId = new ObjectId(data.id);
-      const result = await users.updateOne(
-        { _id: userId, role: { $in: ["student", "tutor"] } },
-        { $set: { role: data.role, updatedAt: new Date() } },
-      );
-
-      if (result.matchedCount === 0) {
         const user = await users.findOne(
           { _id: userId },
-          { projection: { _id: 1 } },
+        {
+          projection: {
+            role: 1,
+            stripeSubscriptionPlan: 1,
+            stripeSubscriptionStatus: 1,
+          },
+        },
         );
 
         if (!user) {
           return res.status(404).send({ message: "User not found." });
         }
 
+      if (user.role === "admin") {
         return res
           .status(409)
           .send({ message: "Admin account roles cannot be changed." });
+      }
+
+      const newRolePlan = data.role === "tutor" ? "pro_tutor" : "pro_student";
+
+      if (
+        isSubscriptionEntitled(user.stripeSubscriptionStatus) &&
+        user.stripeSubscriptionPlan !== newRolePlan
+      ) {
+        return res.status(409).send({
+          message:
+            "Cancel the current subscription before changing this account's role.",
+        });
+      }
+
+      const result = await users.updateOne(
+        {
+          _id: userId,
+          role: { $in: ["student", "tutor"] },
+          $or: [
+            {
+              stripeSubscriptionStatus: {
+                $nin: ["active", "trialing", "past_due"],
+              },
+            },
+            { stripeSubscriptionPlan: newRolePlan },
+          ],
+        },
+        { $set: { role: data.role, updatedAt: new Date() } },
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(409).send({
+          message:
+            "The account changed before the role update. Please try again.",
+        });
       }
 
       return res.send({ id: data.id, role: data.role });
@@ -131,31 +818,116 @@ app.patch(
   },
 );
 
+app.get("/api/admin/dashboard", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const [
+      totalUsers,
+      totalTutors,
+      pendingTuitions,
+      approvedTuitions,
+      revenue,
+    ] = await Promise.all([
+      users.countDocuments({}),
+      users.countDocuments({ role: "tutor" }),
+      tuitions.countDocuments({ approvalStatus: "pending" }),
+      tuitions.countDocuments({ approvalStatus: "approved" }),
+      payments
+        .aggregate([
+          { $match: { status: "paid" } },
+          {
+            $group: {
+              _id: "$currency",
+              amountMinor: { $sum: "$amountMinor" },
+              paymentCount: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray(),
+    ]);
+
+    return res.send({
+      totalUsers,
+      totalTutors,
+      pendingTuitions,
+      approvedTuitions,
+      revenue: revenue.map((total) => ({
+        currency: total._id,
+        amountMinor: total.amountMinor,
+        paymentCount: total.paymentCount,
+      })),
+    });
+  } catch (error) {
+    console.error("Failed to fetch admin dashboard summary:", error);
+    return res
+      .status(500)
+      .send({ message: "Unable to load admin dashboard statistics." });
+  }
+});
+
 app.get(
-  "/api/admin/dashboard",
+  "/api/admin/transactions",
   verifyToken,
   verifyAdmin,
   async (req, res) => {
     try {
-      const [totalUsers, totalTutors, pendingTuitions, approvedTuitions] =
-        await Promise.all([
-          users.countDocuments({}),
-          users.countDocuments({ role: "tutor" }),
-          tuitions.countDocuments({ approvalStatus: "pending" }),
-          tuitions.countDocuments({ approvalStatus: "approved" }),
-        ]);
+      const paymentRows = await payments
+        .find(
+          { status: "paid" },
+          {
+            projection: {
+              _id: 1,
+              userId: 1,
+              plan: 1,
+              amountMinor: 1,
+              currency: 1,
+              createdAt: 1,
+              invoiceUrl: 1,
+            },
+          },
+        )
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(100)
+        .toArray();
+      const userIds = paymentRows
+        .map((payment) => toObjectId(payment.userId))
+        .filter(Boolean);
+      const customerRows = userIds.length
+        ? await users
+            .find(
+              { _id: { $in: userIds } },
+              { projection: { _id: 1, name: 1, email: 1 } },
+            )
+            .toArray()
+        : [];
+      const customersById = new Map(
+        customerRows.map((customer) => [customer._id.toString(), customer]),
+      );
 
       return res.send({
-        totalUsers,
-        totalTutors,
-        pendingTuitions,
-        approvedTuitions,
+        transactions: paymentRows.map((payment) => {
+          const userId = toObjectId(payment.userId)?.toString();
+          const customer = userId ? customersById.get(userId) : undefined;
+
+          return {
+            id: payment._id,
+            plan: payment.plan,
+            amountMinor: payment.amountMinor,
+            currency: payment.currency,
+            status: "paid",
+            createdAt: payment.createdAt.toISOString(),
+            invoiceUrl: payment.invoiceUrl ?? null,
+            customer: customer
+              ? { name: customer.name ?? null, email: customer.email ?? null }
+              : null,
+          };
+        }),
       });
     } catch (error) {
-      console.error("Failed to fetch admin dashboard summary:", error);
+      console.error("Failed to fetch admin transactions:", error);
       return res
         .status(500)
-        .send({ message: "Unable to load admin dashboard statistics." });
+        .send({ message: "Unable to load transactions." });
     }
   },
 );
@@ -372,11 +1144,7 @@ app.patch(
   },
 );
 
-app.get(
-  "/api/tutor/dashboard",
-  verifyToken,
-  verifyTutor,
-  async (req, res) => {
+app.get("/api/tutor/dashboard", verifyToken, verifyTutor, async (req, res) => {
     try {
       const tuitionRows = await tuitions
         .find(
@@ -399,35 +1167,67 @@ app.get(
         : 0;
       const latestApplications = tuitionIds.length
         ? await applications
-            .find(
-              { tuitionId: { $in: tuitionIds } },
+          .aggregate([
+            { $match: { tuitionId: { $in: tuitionIds } } },
               {
-                projection: {
-                  _id: 1,
-                  studentId: 1,
-                  tuitionId: 1,
-                  status: 1,
+              $lookup: {
+                from: "user",
+                localField: "studentId",
+                foreignField: "_id",
+                as: "student",
+              },
+            },
+            {
+              $unwind: {
+                path: "$student",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $addFields: {
+                studentPlanPriority: {
+                  $cond: [
+                    {
+                      $and: [
+                        { $eq: ["$student.plan", "pro"] },
+                        {
+                          $eq: [
+                            "$student.stripeSubscriptionPlan",
+                            "pro_student",
+                          ],
+                        },
+                      ],
+                    },
+                    1,
+                    0,
+                  ],
                 },
               },
-            )
-            .sort({ createdAt: -1, _id: -1 })
-            .limit(3)
+            },
+            {
+              $sort: {
+                studentPlanPriority: -1,
+                createdAt: -1,
+                _id: -1,
+              },
+            },
+            { $limit: 3 },
+            {
+              $project: {
+                  _id: 1,
+                  tuitionId: 1,
+                  status: 1,
+                student: {
+                  name: "$student.name",
+                  image: "$student.image",
+                  plan: "$student.plan",
+                  stripeSubscriptionPlan: "$student.stripeSubscriptionPlan",
+                },
+              },
+            },
+          ])
             .toArray()
         : [];
-      const studentIds = latestApplications
-        .map((application) => toObjectId(application.studentId))
-        .filter(Boolean);
-      const students = studentIds.length
-        ? await users
-            .find(
-              { _id: { $in: studentIds }, role: "student" },
-              { projection: { _id: 1, name: 1, image: 1 } },
-            )
-            .toArray()
-        : [];
-      const studentsById = new Map(
-        students.map((student) => [student._id.toString(), student]),
-      );
       const tuitionsById = new Map(
         tuitionRows.map((tuition) => [tuition._id.toString(), tuition]),
       );
@@ -440,19 +1240,17 @@ app.get(
         ).length,
         applicantsCount,
         latestApplicants: latestApplications.map((application) => {
-          const studentId = toObjectId(application.studentId)?.toString();
-          const student = studentId
-            ? studentsById.get(studentId)
-            : undefined;
           const tuitionId = toObjectId(application.tuitionId)?.toString();
-          const tuition = tuitionId
-            ? tuitionsById.get(tuitionId)
-            : undefined;
+        const tuition = tuitionId ? tuitionsById.get(tuitionId) : undefined;
 
           return {
             id: application._id.toString(),
-            student: student
-              ? { name: student.name, image: student.image ?? null }
+          student: application.student?.name
+            ? {
+                name: application.student.name,
+                image: application.student.image ?? null,
+                plan: getPlanForRole(application.student, "student"),
+              }
               : null,
             tuitionTitle: tuition?.title ?? "Tuition unavailable",
             status: application.status,
@@ -465,8 +1263,7 @@ app.get(
         .status(500)
         .send({ message: "Unable to load your tutor dashboard." });
     }
-  },
-);
+});
 
 app.get(
   "/api/tuitions/mine/usage",
@@ -478,7 +1275,9 @@ app.get(
         tutorId: req.user._id,
       });
 
-      return res.send(getTutorPostUsage(req.user.plan, postsUsed));
+      return res.send(
+        getTutorPostUsage(getPlanForRole(req.user, "tutor"), postsUsed),
+      );
     } catch (error) {
       console.error("Failed to get tutor tuition usage:", error);
       return res
@@ -528,7 +1327,16 @@ app.get(
         ? await users
             .find(
               { _id: { $in: studentIds }, role: "student" },
-              { projection: { _id: 1, name: 1, email: 1, image: 1 } },
+              {
+                projection: {
+                  _id: 1,
+                  name: 1,
+                  email: 1,
+                  image: 1,
+                  plan: 1,
+                  stripeSubscriptionPlan: 1,
+                },
+              },
             )
             .toArray()
         : [];
@@ -539,16 +1347,11 @@ app.get(
         tuitionRows.map((tuition) => [tuition._id.toString(), tuition]),
       );
 
-      return res.send({
-        applications: applicationRows.map((application) => {
+      const formattedApplications = applicationRows.map((application) => {
           const studentId = toObjectId(application.studentId)?.toString();
-          const student = studentId
-            ? studentsById.get(studentId)
-            : undefined;
+        const student = studentId ? studentsById.get(studentId) : undefined;
           const tuitionId = toObjectId(application.tuitionId)?.toString();
-          const tuition = tuitionId
-            ? tuitionsById.get(tuitionId)
-            : undefined;
+        const tuition = tuitionId ? tuitionsById.get(tuitionId) : undefined;
 
           return {
             id: application._id.toString(),
@@ -562,6 +1365,7 @@ app.get(
                   name: student.name,
                   email: student.email,
                   image: student.image ?? null,
+                plan: getPlanForRole(student, "student"),
                 }
               : null,
             tuition: tuition
@@ -572,7 +1376,10 @@ app.get(
                 }
               : null,
           };
-        }),
+      });
+
+      return res.send({
+        applications: prioritizeProStudentApplications(formattedApplications),
       });
     } catch (error) {
       console.error("Failed to fetch tutor applications:", error);
@@ -1000,11 +1807,7 @@ app.patch(
   },
 );
 
-app.patch(
-  "/api/tuitions/:id",
-  verifyToken,
-  verifyTutor,
-  async (req, res) => {
+app.patch("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
     const { data, error } = validateNewTuition(req.body);
 
     if (error) {
@@ -1039,14 +1842,9 @@ app.patch(
       console.error("Failed to update tutor tuition:", error);
       return res.status(500).send({ message: "Unable to update this tuition." });
     }
-  },
-);
+});
 
-app.delete(
-  "/api/tuitions/:id",
-  verifyToken,
-  verifyTutor,
-  async (req, res) => {
+app.delete("/api/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
     if (!/^[a-f\d]{24}$/i.test(req.params.id)) {
       return res.status(400).send({ message: "Invalid tuition ID." });
     }
@@ -1066,8 +1864,7 @@ app.delete(
       console.error("Failed to delete tutor tuition:", error);
       return res.status(500).send({ message: "Unable to delete this tuition." });
     }
-  },
-);
+});
 
 const parseBannerImage = express.raw({
   type: ["image/png", "image/jpeg"],
@@ -1081,7 +1878,9 @@ function handleBannerImageBody(req, res, next) {
     }
 
     if (error.type === "entity.too.large") {
-      return res.status(413).send({ message: "Image must be 2 MB or smaller." });
+      return res
+        .status(413)
+        .send({ message: "Image must be 2 MB or smaller." });
     }
 
     return res.status(400).send({ message: "Invalid image upload." });
@@ -1090,9 +1889,9 @@ function handleBannerImageBody(req, res, next) {
 
 function hasValidImageSignature(buffer, contentType) {
   if (contentType === "image/png") {
-    return buffer.subarray(0, 8).equals(
-      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    );
+    return buffer
+      .subarray(0, 8)
+      .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
   }
 
   return (
@@ -1224,7 +2023,10 @@ app.post(
           .send({ message: "Unable to check your tuition posting limit." });
       }
 
-      if (!getTutorPostUsage(req.user.plan, postsUsed).canCreate) {
+      if (
+        !getTutorPostUsage(getPlanForRole(req.user, "tutor"), postsUsed)
+          .canCreate
+      ) {
         return res.status(403).send({
           message:
             "Free tutors can post up to 2 tuitions. Upgrade to Pro to post more.",
@@ -1294,7 +2096,10 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res) => {
     const postsUsed = await tuitions.countDocuments({
       tutorId: req.user._id,
     });
-    const usage = getTutorPostUsage(req.user.plan, postsUsed);
+    const usage = getTutorPostUsage(
+      getPlanForRole(req.user, "tutor"),
+      postsUsed,
+    );
 
     if (!usage.canCreate) {
       return res.status(403).send({
@@ -1319,7 +2124,10 @@ app.post("/api/tuitions", verifyToken, verifyTutor, async (req, res) => {
       id: result.insertedId.toString(),
       ...tuition,
       tutorId: req.user._id.toString(),
-      usage: getTutorPostUsage(req.user.plan, postsUsed + 1),
+      usage: getTutorPostUsage(
+        getPlanForRole(req.user, "tutor"),
+        postsUsed + 1,
+      ),
     });
   } catch (error) {
     console.error("Failed to create tuition:", error);
