@@ -5,9 +5,11 @@ import { ObjectId } from "mongodb";
 import { tuitions, users } from "./db.js";
 import {
   verifyToken,
+  verifyAdmin,
   verifyTutor,
 } from "./middleware/auth.js";
 import { parseTuitionsQuery } from "./lib/tuitions-query.js";
+import { validateTuitionApproval } from "./lib/admin-tuition-validation.js";
 import {
   getTutorPostUsage,
   validateNewTuition,
@@ -15,6 +17,18 @@ import {
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+function toObjectId(value) {
+  if (value instanceof ObjectId) {
+    return value;
+  }
+
+  if (typeof value !== "string" || !ObjectId.isValid(value)) {
+    return null;
+  }
+
+  return new ObjectId(value);
+}
 
 // middleware
 app.use(cors());
@@ -88,20 +102,7 @@ app.get("/api/tuitions", async (req, res) => {
       .toArray();
 
     const tutorIds = tuitionRows
-      .map((tuition) => {
-        if (tuition.tutorId instanceof ObjectId) {
-          return tuition.tutorId;
-        }
-
-        if (
-          typeof tuition.tutorId === "string" &&
-          ObjectId.isValid(tuition.tutorId)
-        ) {
-          return new ObjectId(tuition.tutorId);
-        }
-
-        return null;
-      })
+      .map((tuition) => toObjectId(tuition.tutorId))
       .filter(Boolean);
 
     const tutors = tutorIds.length
@@ -119,9 +120,7 @@ app.get("/api/tuitions", async (req, res) => {
     return res.send({
       tuitions: tuitionRows.map((tuition) => {
         const tutorId =
-          tuition.tutorId instanceof ObjectId
-            ? tuition.tutorId.toString()
-            : tuition.tutorId;
+          toObjectId(tuition.tutorId)?.toString() ?? tuition.tutorId;
         const tutor =
           typeof tutorId === "string" ? tutorsById.get(tutorId) : undefined;
 
@@ -157,6 +156,136 @@ app.get("/api/tuitions", async (req, res) => {
     return res.status(500).send({ message: "Unable to load public tuitions." });
   }
 });
+
+app.get(
+  "/api/admin/tuitions/pending",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const tuitionRows = await tuitions
+        .find(
+          { approvalStatus: "pending" },
+          {
+            projection: {
+              _id: 1,
+              title: 1,
+              subject: 1,
+              classLevel: 1,
+              mode: 1,
+              location: 1,
+              monthlyFee: 1,
+              daysPerWeek: 1,
+              description: 1,
+              bannerImage: 1,
+              tutorId: 1,
+              createdAt: 1,
+            },
+          },
+        )
+        .sort({ createdAt: 1, _id: 1 })
+        .toArray();
+
+      const tutorIds = tuitionRows
+        .map((tuition) => toObjectId(tuition.tutorId))
+        .filter(Boolean);
+      const tutors = tutorIds.length
+        ? await users
+            .find(
+              { _id: { $in: tutorIds }, role: "tutor" },
+              { projection: { _id: 1, name: 1, email: 1, image: 1 } },
+            )
+            .toArray()
+        : [];
+      const tutorsById = new Map(
+        tutors.map((tutor) => [tutor._id.toString(), tutor]),
+      );
+
+      return res.send({
+        tuitions: tuitionRows.map((tuition) => {
+          const tutorId = toObjectId(tuition.tutorId)?.toString();
+          const tutor = tutorId ? tutorsById.get(tutorId) : undefined;
+
+          return {
+            id: tuition._id.toString(),
+            title: tuition.title,
+            subject: tuition.subject,
+            classLevel: tuition.classLevel,
+            mode: tuition.mode,
+            location: tuition.location,
+            monthlyFee: tuition.monthlyFee,
+            daysPerWeek: tuition.daysPerWeek,
+            description: tuition.description,
+            bannerImage: tuition.bannerImage ?? null,
+            createdAt: tuition.createdAt,
+            tutor: tutor
+              ? {
+                  name: tutor.name,
+                  email: tutor.email,
+                  image: tutor.image ?? null,
+                }
+              : null,
+          };
+        }),
+      });
+    } catch (error) {
+      console.error("Failed to fetch pending tuition approvals:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to load pending tuition approvals." });
+    }
+  },
+);
+
+app.patch(
+  "/api/admin/tuitions/:id/approval",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { data, error } = validateTuitionApproval(req.params.id, req.body);
+
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+
+    try {
+      const result = await tuitions.updateOne(
+        { _id: new ObjectId(data.id), approvalStatus: "pending" },
+        {
+          $set: {
+            approvalStatus: data.approvalStatus,
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        const tuition = await tuitions.findOne(
+          { _id: new ObjectId(data.id) },
+          { projection: { approvalStatus: 1 } },
+        );
+
+        if (!tuition) {
+          return res.status(404).send({ message: "Tuition not found." });
+        }
+
+        return res
+          .status(409)
+          .send({ message: "This tuition has already been reviewed." });
+      }
+
+      return res.send({
+        id: data.id,
+        approvalStatus: data.approvalStatus,
+      });
+    } catch (error) {
+      console.error("Failed to update tuition approval:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to update this tuition approval." });
+    }
+  },
+);
 
 const parseBannerImage = express.raw({
   type: ["image/png", "image/jpeg"],
