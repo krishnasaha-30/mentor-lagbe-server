@@ -2,14 +2,16 @@ import express from "express";
 import cors from "cors";
 import { ObjectId } from "mongodb";
 
-import { tuitions, users } from "./db.js";
+import { applications, tuitions, users } from "./db.js";
 import {
+  verifyStudent,
   verifyToken,
   verifyAdmin,
   verifyTutor,
 } from "./middleware/auth.js";
 import { parseTuitionsQuery } from "./lib/tuitions-query.js";
 import { validateTuitionApproval } from "./lib/admin-tuition-validation.js";
+import { validateNewApplication } from "./lib/application-validation.js";
 import {
   getTutorPostUsage,
   validateNewTuition,
@@ -156,6 +158,118 @@ app.get("/api/tuitions", async (req, res) => {
     return res.status(500).send({ message: "Unable to load public tuitions." });
   }
 });
+
+app.get("/api/tuitions/:id", async (req, res) => {
+  const tuitionId = toObjectId(req.params.id);
+
+  if (!tuitionId || !/^[a-f\d]{24}$/i.test(req.params.id)) {
+    return res.status(404).send({ message: "Tuition not found." });
+  }
+
+  try {
+    const tuition = await tuitions.findOne({
+      _id: tuitionId,
+      approvalStatus: "approved",
+      isActive: true,
+    });
+
+    if (!tuition) {
+      return res.status(404).send({ message: "Tuition not found." });
+    }
+
+    const tutorId = toObjectId(tuition.tutorId);
+    const tutor = tutorId
+      ? await users.findOne(
+          { _id: tutorId, role: "tutor" },
+          { projection: { _id: 1, name: 1, image: 1, plan: 1 } },
+        )
+      : null;
+
+    return res.send({
+      id: tuition._id.toString(),
+      title: tuition.title,
+      subject: tuition.subject,
+      classLevel: tuition.classLevel,
+      mode: tuition.mode,
+      location: tuition.location,
+      monthlyFee: tuition.monthlyFee,
+      daysPerWeek: tuition.daysPerWeek,
+      description: tuition.description,
+      bannerImage: tuition.bannerImage ?? null,
+      createdAt: tuition.createdAt,
+      tutor: tutor
+        ? {
+            name: tutor.name,
+            image: tutor.image ?? null,
+            plan: tutor.plan === "pro" ? "pro" : "free",
+          }
+        : null,
+    });
+  } catch (error) {
+    console.error("Failed to fetch tuition details:", error);
+    return res.status(500).send({ message: "Unable to load tuition details." });
+  }
+});
+
+app.post(
+  "/api/tuitions/:id/applications",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    const { data, error } = validateNewApplication(req.params.id, req.body);
+
+    if (error) {
+      return res.status(400).send({ message: error });
+    }
+
+    try {
+      const tuitionId = new ObjectId(data.tuitionId);
+      const tuition = await tuitions.findOne({
+        _id: tuitionId,
+        approvalStatus: "approved",
+        isActive: true,
+      });
+
+      if (!tuition) {
+        return res.status(404).send({ message: "Tuition not found." });
+      }
+
+      const existingApplication = await applications.findOne({
+        tuitionId,
+        studentId: req.user._id,
+      });
+
+      if (existingApplication) {
+        return res
+          .status(409)
+          .send({ message: "You have already applied to this tuition." });
+      }
+
+      const now = new Date();
+      const application = {
+        ...data,
+        tuitionId,
+        studentId: req.user._id,
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const result = await applications.insertOne(application);
+
+      return res.status(201).send({
+        id: result.insertedId.toString(),
+        tuitionId: tuitionId.toString(),
+        status: application.status,
+        createdAt: now,
+      });
+    } catch (error) {
+      console.error("Failed to submit tuition application:", error);
+      return res
+        .status(500)
+        .send({ message: "Unable to submit your application." });
+    }
+  },
+);
 
 app.get(
   "/api/admin/tuitions/pending",

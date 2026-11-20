@@ -14,3 +14,4 @@ export const database = client.db("mentor-lagbe-app");
 export const users = database.collection("user");
 export const sessions = database.collection("session");
 export const tuitions = database.collection("tuitions");
+export const applications = database.collection("applications");
